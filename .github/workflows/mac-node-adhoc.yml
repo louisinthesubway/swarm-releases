@@ -1,0 +1,326 @@
+name: SWARM Node 0.2.0-mainnet.5 macOS ad hoc re-sign
+
+# The per-architecture macOS builds of SWARM Node 0.2.0-mainnet.5 were packaged
+# by electron-builder with `mac.identity: null`. electron-builder rewrote
+# Info.plist and renamed the executable after Electron's own linker signature
+# was made, so the bundle's signature no longer matches its contents and a
+# downloaded copy is refused by macOS as "damaged and can't be opened".
+#
+# This workflow does not rebuild anything. For each architecture it downloads
+# the exact published DMG from the project's own download server, checks its
+# size and SHA-256, copies the volume out, signs every Mach-O and every nested
+# bundle in the app ad hoc (identity "-"), inside out, then the app itself,
+# verifies the result strictly, rebuilds a DMG with the same volume name,
+# contents and image format, and starts the app from a copy taken out of the
+# new DMG for a short smoke test.
+#
+# Ad hoc is not Developer ID and is not notarized: Gatekeeper still asks the
+# user to allow the app once. It is no longer reported as damaged.
+#
+# Triggered by a push to ci/mac-node-adhoc (a workflow_dispatch workflow must
+# exist on the default branch to be dispatched; this one is kept off main).
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ci/mac-node-adhoc]
+    paths: ['.github/workflows/mac-node-adhoc.yml']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mac-node-adhoc-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  VERSION: 0.2.0-mainnet.5
+  BUNDLE_ID: green.swarm.node
+  SRC_BASE: https://lwd-main.swarm.green/downloads/swarm-node-0.2.0-mainnet.5-macos
+
+jobs:
+  resign:
+    name: re-sign (${{ matrix.arch }}, ${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Apple silicon: the arm64 app runs natively.
+          - arch: arm64
+            runner: macos-14
+            want_arch: arm64
+            in_sha256: 84ed1983f0d57ec6c7ca4e138bb75b35eae5854e0dd68597ad42914c1d79ed31
+            in_bytes: 170264514
+          # Intel runner: the x64 app runs natively, no Rosetta involved.
+          - arch: x64
+            runner: macos-15-intel
+            want_arch: x86_64
+            in_sha256: 0344c74c07033d4ef45733b8dac192e6649db7173e3487c76d8328fa02ce4a1f
+            in_bytes: 175634183
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    env:
+      IN_NAME: SWARM-Node-0.2.0-mainnet.5-mac-${{ matrix.arch }}.dmg
+      OUT_NAME: SWARM-Node-0.2.0-mainnet.5-mac-${{ matrix.arch }}-adhoc.dmg
+      EVIDENCE: ${{ github.workspace }}/evidence
+    steps:
+      - name: Runner facts
+        run: |
+          set -euo pipefail
+          mkdir -p "$EVIDENCE"
+          { uname -a; sw_vers; uname -m; xcrun --find codesign; } | tee "$EVIDENCE/runner.txt"
+
+      - name: Download the published DMG and check size and SHA-256
+        run: |
+          set -euo pipefail
+          mkdir -p in
+          curl -fL --retry 5 --retry-delay 5 -o "in/$IN_NAME" "$SRC_BASE/$IN_NAME"
+          bytes=$(stat -f %z "in/$IN_NAME")
+          sum=$(shasum -a 256 "in/$IN_NAME" | awk '{print $1}')
+          echo "input $IN_NAME bytes=$bytes sha256=$sum" | tee "$EVIDENCE/input.txt"
+          test "$bytes" = "${{ matrix.in_bytes }}"
+          test "$sum" = "${{ matrix.in_sha256 }}"
+
+      - name: Copy the original volume out
+        run: |
+          set -euo pipefail
+          hdiutil verify "in/$IN_NAME"
+          format=$(hdiutil imageinfo "in/$IN_NAME" | awk -F': ' '/^Format:/ {print $2; exit}')
+          test -n "$format"
+          echo "FORMAT=$format" >> "$GITHUB_ENV"
+          hdiutil attach -readonly -nobrowse -noautoopen -mountpoint /Volumes/swarm-orig "in/$IN_NAME"
+          volname=$(diskutil info /Volumes/swarm-orig | awk -F': *' '/Volume Name:/ {print $2; exit}')
+          fs=$(diskutil info /Volumes/swarm-orig | awk -F': *' '/Type \(Bundle\):/ {print $2; exit}')
+          test -n "$volname"
+          echo "VOLNAME=$volname" >> "$GITHUB_ENV"
+          { echo "format=$format"; echo "volname=$volname"; echo "fs=$fs"; ls -la /Volumes/swarm-orig; } | tee "$EVIDENCE/original-volume.txt"
+          mkdir -p stage
+          ditto /Volumes/swarm-orig stage
+          hdiutil detach /Volumes/swarm-orig || hdiutil detach -force /Volumes/swarm-orig
+          rm -rf stage/.Trashes stage/.fseventsd
+          apps=$(find stage -maxdepth 1 -name '*.app' -type d | wc -l | tr -d ' ')
+          test "$apps" = "1"
+          app=$(find stage -maxdepth 1 -name '*.app' -type d)
+          echo "APP=$app" >> "$GITHUB_ENV"
+          echo "APP_NAME=$(basename "$app")" >> "$GITHUB_ENV"
+          ls -la stage | tee -a "$EVIDENCE/original-volume.txt"
+
+      - name: Record the original signature state
+        run: |
+          set -uo pipefail
+          plist="$APP/Contents/Info.plist"
+          id=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$plist")
+          ver=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist")
+          exe=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$plist")
+          echo "id=$id version=$ver executable=$exe" | tee "$EVIDENCE/original-signature.txt"
+          test "$id" = "$BUNDLE_ID" || exit 1
+          test "$ver" = "$VERSION" || exit 1
+          echo "EXE=$exe" >> "$GITHUB_ENV"
+          lipo -archs "$APP/Contents/MacOS/$exe" | tee -a "$EVIDENCE/original-signature.txt"
+          lipo -archs "$APP/Contents/MacOS/$exe" | grep -qw "${{ matrix.want_arch }}" || exit 1
+          echo "--- codesign --verify --deep --strict on the ORIGINAL (expected to fail) ---" | tee -a "$EVIDENCE/original-signature.txt"
+          codesign --verify --deep --strict --verbose=2 "$APP" 2>&1 | tee -a "$EVIDENCE/original-signature.txt" || true
+          codesign -dv --verbose=4 "$APP" 2>&1 | tee -a "$EVIDENCE/original-signature.txt" || true
+          echo "--- entitlements on the ORIGINAL ---" | tee -a "$EVIDENCE/original-signature.txt"
+          codesign -d --entitlements - "$APP" 2>&1 | tee -a "$EVIDENCE/original-signature.txt" || true
+
+      - name: Sign ad hoc, inside out
+        run: |
+          set -euo pipefail
+          log="$EVIDENCE/signing.txt"
+          : > "$log"
+          # Finder info, resource forks and quarantine flags are not allowed
+          # inside a signed bundle.
+          xattr -cr "$APP"
+          # 1. Every Mach-O file, deepest path first: dylibs, helpers' and
+          #    frameworks' executables, native .node modules and the node and
+          #    miner binaries in Resources (which --deep would not sign, and
+          #    which Apple silicon will not run without a valid signature).
+          find "$APP" -type f -print0 | while IFS= read -r -d '' f; do
+            if file -b "$f" | grep -q 'Mach-O'; then printf '%s\n' "$f"; fi
+          done | awk -F/ '{print NF "\t" $0}' | sort -rn -k1,1 | cut -f2- > macho.txt
+          echo "Mach-O files: $(wc -l < macho.txt | tr -d ' ')" | tee -a "$log"
+          while IFS= read -r f; do
+            echo "codesign --force --sign - \"${f#stage/}\"" >> "$log"
+            codesign --force --sign - "$f"
+          done < macho.txt
+          # 2. Every nested bundle, deepest first.
+          find "$APP/Contents" -type d \( -name '*.framework' -o -name '*.app' -o -name '*.xpc' -o -name '*.appex' -o -name '*.bundle' -o -name '*.plugin' \) \
+            | awk -F/ '{print NF "\t" $0}' | sort -rn -k1,1 | cut -f2- > bundles.txt
+          while IFS= read -r b; do
+            case "$b" in
+              *.framework) ;;
+              *) test -d "$b/Contents/MacOS" || { echo "skip (no executable): ${b#stage/}" >> "$log"; continue; } ;;
+            esac
+            echo "codesign --force --sign - \"${b#stage/}\"" >> "$log"
+            codesign --force --sign - "$b"
+          done < bundles.txt
+          # 3. The app itself.
+          echo "codesign --force --sign - \"${APP#stage/}\"" >> "$log"
+          codesign --force --sign - "$APP"
+          cat "$log"
+
+      - name: Verify the re-signed app strictly
+        run: |
+          set -euo pipefail
+          out="$EVIDENCE/verify-stage.txt"
+          codesign --verify --deep --strict --verbose=2 "$APP" 2>&1 | tee "$out"
+          codesign -dv --verbose=4 "$APP" 2>&1 | tee -a "$out"
+          grep -q '^Signature=adhoc' "$out"
+          grep -q "^Identifier=$BUNDLE_ID\$" "$out"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")" = "$VERSION"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Contents/Info.plist")" = "$BUNDLE_ID"
+          # Each Mach-O, on its own, strictly.
+          n=0
+          while IFS= read -r f; do
+            codesign --verify --strict "$f"
+            n=$((n+1))
+          done < macho.txt
+          echo "each of $n Mach-O files verifies strictly on its own" | tee -a "$out"
+          echo "--- spctl (informational: an ad hoc app is expected to be rejected by Gatekeeper assessment) ---" | tee -a "$out"
+          spctl --assess --type execute --verbose=4 "$APP" 2>&1 | tee -a "$out" || true
+
+      - name: Start the bundled node and miner binaries
+        run: |
+          set -uo pipefail
+          out="$EVIDENCE/bundled-binaries.txt"
+          : > "$out"
+          fail=0
+          for name in swarm-node-daemon swarm-miner; do
+            bin=$(find "$APP/Contents/Resources" -type f -name "$name" | head -1)
+            if [ -z "$bin" ]; then echo "$name: not found in Resources" | tee -a "$out"; continue; fi
+            echo "== ${bin#stage/}: $(lipo -archs "$bin")" | tee -a "$out"
+            arg=--version; [ "$name" = swarm-miner ] && arg=--help
+            perl -e 'alarm 30; exec @ARGV' "$bin" "$arg" > bin.log 2>&1
+            rc=$?
+            head -8 bin.log | tee -a "$out"
+            echo "$name $arg exit=$rc" | tee -a "$out"
+            # 128+ means the process was killed by a signal: an invalid
+            # signature on Apple silicon is SIGKILL (137), a missing library
+            # SIGABRT (134). 142 is our own 30 s alarm: it was running.
+            if [ "$rc" -ge 128 ] && [ "$rc" -ne 142 ]; then fail=1; fi
+          done
+          exit $fail
+
+      - name: Build the ad hoc DMG with the original volume name, layout and format
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          extra=()
+          case "$FORMAT" in UDZO) extra=(-imagekey zlib-level=9) ;; esac
+          for i in 1 2 3 4 5; do
+            if hdiutil create -volname "$VOLNAME" -srcfolder stage -fs HFS+ -format "$FORMAT" ${extra[@]+"${extra[@]}"} -ov "out/$OUT_NAME"; then break; fi
+            echo "hdiutil create failed (attempt $i); retrying"; sleep 10
+            test "$i" != 5
+          done
+          hdiutil verify "out/$OUT_NAME"
+          { echo "hdiutil create -volname \"$VOLNAME\" -srcfolder stage -fs HFS+ -format $FORMAT ${extra[*]:-} out/$OUT_NAME"; hdiutil imageinfo "out/$OUT_NAME" | grep -E '^Format:|Checksum Value|^Size'; } | tee "$EVIDENCE/dmg.txt"
+
+      - name: Verify the app inside the new DMG and install a copy
+        run: |
+          set -euo pipefail
+          out="$EVIDENCE/verify-dmg.txt"
+          hdiutil attach -readonly -nobrowse -noautoopen -mountpoint /Volumes/swarm-new "out/$OUT_NAME"
+          trap 'hdiutil detach /Volumes/swarm-new || hdiutil detach -force /Volumes/swarm-new || true' EXIT
+          ls -la /Volumes/swarm-new | tee "$out"
+          test "$(readlink /Volumes/swarm-new/Applications)" = "/Applications"
+          diskutil info /Volumes/swarm-new | awk -F': *' '/Volume Name:/ {print "volname=" $2; exit}' | tee -a "$out"
+          codesign --verify --deep --strict --verbose=2 "/Volumes/swarm-new/$APP_NAME" 2>&1 | tee -a "$out"
+          codesign -dv --verbose=4 "/Volumes/swarm-new/$APP_NAME" 2>&1 | tee -a "$out"
+          grep -q '^Signature=adhoc' "$out"
+          grep -q "^Identifier=$BUNDLE_ID\$" "$out"
+          a=$(codesign -dv "$APP" 2>&1 | awk -F= '/^CDHash=/ {print $2}')
+          b=$(codesign -dv "/Volumes/swarm-new/$APP_NAME" 2>&1 | awk -F= '/^CDHash=/ {print $2}')
+          echo "cdhash stage=$a dmg=$b" | tee -a "$out"
+          test -n "$a" && test "$a" = "$b"
+          mkdir -p "$RUNNER_TEMP/installed"
+          ditto "/Volumes/swarm-new/$APP_NAME" "$RUNNER_TEMP/installed/$APP_NAME"
+          codesign --verify --deep --strict --verbose=2 "$RUNNER_TEMP/installed/$APP_NAME" 2>&1 | tee -a "$out"
+
+      - name: Smoke test - start the installed copy and keep it up for 20 s
+        run: |
+          set -uo pipefail
+          out="$EVIDENCE/smoke.txt"
+          app="$RUNNER_TEMP/installed/$APP_NAME"
+          home=$(mktemp -d)
+          marker=$(mktemp); sleep 1
+          echo "starting $app/Contents/MacOS/$EXE ($(lipo -archs "$app/Contents/MacOS/$EXE")) on $(uname -m)" | tee "$out"
+          HOME="$home" ELECTRON_ENABLE_LOGGING=1 "$app/Contents/MacOS/$EXE" \
+            --user-data-dir="$home/user-data" --remote-debugging-port=9333 > "$EVIDENCE/smoke-process-output.log" 2>&1 &
+          pid=$!
+          up=0
+          for s in $(seq 1 20); do
+            sleep 1
+            if kill -0 "$pid" 2>/dev/null; then up=$s; else break; fi
+          done
+          echo "process $pid stayed up ${up}s of 20" | tee -a "$out"
+          echo "--- DevTools page list (informational) ---" | tee -a "$out"
+          curl -s --max-time 5 http://127.0.0.1:9333/json/list | tee -a "$out" || true
+          echo | tee -a "$out"
+          echo "--- processes of the app ---" | tee -a "$out"
+          ps -ax -o pid,ppid,etime,command | grep -F "$RUNNER_TEMP/installed" | grep -v grep | cut -c1-220 | tee -a "$out" || true
+          alive=0; kill -0 "$pid" 2>/dev/null && alive=1
+          kill -TERM "$pid" 2>/dev/null || true
+          sleep 5
+          pkill -f "$RUNNER_TEMP/installed" 2>/dev/null || true
+          sleep 3
+          echo "--- crash reports written since launch ---" | tee -a "$out"
+          crashes=$(find "/Users/$(id -un)/Library/Logs/DiagnosticReports" /Library/Logs/DiagnosticReports -type f -newer "$marker" 2>/dev/null \
+            | grep -i -E "swarm|electron|$(printf '%s' "$EXE" | sed 's/[^A-Za-z0-9]/./g')" || true)
+          echo "${crashes:-none}" | tee -a "$out"
+          if [ -n "$crashes" ]; then mkdir -p "$EVIDENCE/crash"; while IFS= read -r c; do cp "$c" "$EVIDENCE/crash/" || true; done <<< "$crashes"; fi
+          echo "--- last lines of process output ---"; tail -40 "$EVIDENCE/smoke-process-output.log" || true
+          if [ "$up" -lt 20 ] || [ "$alive" -ne 1 ]; then echo "::error::the app did not stay up for 20 s"; exit 1; fi
+          if [ -n "$crashes" ]; then echo "::error::crash report written"; exit 1; fi
+          echo "SMOKE PASS: up 20 s, no crash report" | tee -a "$out"
+
+      - name: Write SHA256SUMS for this architecture
+        run: |
+          set -euo pipefail
+          cd out
+          shasum -a 256 "$OUT_NAME" > "SHA256SUMS-mac-${{ matrix.arch }}"
+          echo "$(stat -f %z "$OUT_NAME") bytes" >> "$EVIDENCE/dmg.txt"
+          cat "SHA256SUMS-mac-${{ matrix.arch }}" | tee -a "$EVIDENCE/dmg.txt"
+
+      - name: Keep the DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: dmg-mac-${{ matrix.arch }}
+          path: |
+            out/${{ env.OUT_NAME }}
+            out/SHA256SUMS-mac-${{ matrix.arch }}
+          compression-level: 0
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Keep the evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidence-mac-${{ matrix.arch }}
+          path: evidence/
+          retention-days: 30
+          if-no-files-found: ignore
+
+  sums:
+    needs: resign
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dmg-mac-*
+          merge-multiple: true
+          path: release
+      - name: Check per-architecture sums and write SHA256SUMS
+        run: |
+          set -euo pipefail
+          cd release
+          cat SHA256SUMS-mac-arm64 SHA256SUMS-mac-x64 | sha256sum -c -
+          sha256sum SWARM-Node-0.2.0-mainnet.5-mac-arm64-adhoc.dmg SWARM-Node-0.2.0-mainnet.5-mac-x64-adhoc.dmg > SHA256SUMS
+          cat SHA256SUMS
+          ls -l
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SHA256SUMS
+          path: release/SHA256SUMS
+          retention-days: 30

@@ -93,6 +93,8 @@ jobs:
           fs=$(diskutil info /Volumes/swarm-orig | awk -F': *' '/Type \(Bundle\):/ {print $2; exit}')
           test -n "$volname"
           echo "VOLNAME=$volname" >> "$GITHUB_ENV"
+          # Keep the original image's file system (electron-builder chose it).
+          case "$fs" in apfs) echo "FS=APFS" >> "$GITHUB_ENV" ;; *) echo "FS=HFS+" >> "$GITHUB_ENV" ;; esac
           { echo "format=$format"; echo "volname=$volname"; echo "fs=$fs"; ls -la /Volumes/swarm-orig; } | tee "$EVIDENCE/original-volume.txt"
           mkdir -p stage
           ditto /Volumes/swarm-orig stage
@@ -209,12 +211,12 @@ jobs:
           extra=()
           case "$FORMAT" in UDZO) extra=(-imagekey zlib-level=9) ;; esac
           for i in 1 2 3 4 5; do
-            if hdiutil create -volname "$VOLNAME" -srcfolder stage -fs HFS+ -format "$FORMAT" ${extra[@]+"${extra[@]}"} -ov "out/$OUT_NAME"; then break; fi
+            if hdiutil create -volname "$VOLNAME" -srcfolder stage -fs "$FS" -format "$FORMAT" ${extra[@]+"${extra[@]}"} -ov "out/$OUT_NAME"; then break; fi
             echo "hdiutil create failed (attempt $i); retrying"; sleep 10
             test "$i" != 5
           done
           hdiutil verify "out/$OUT_NAME"
-          { echo "hdiutil create -volname \"$VOLNAME\" -srcfolder stage -fs HFS+ -format $FORMAT ${extra[*]:-} out/$OUT_NAME"; hdiutil imageinfo "out/$OUT_NAME" | grep -E '^Format:|Checksum Value|^Size'; } | tee "$EVIDENCE/dmg.txt"
+          { echo "hdiutil create -volname \"$VOLNAME\" -srcfolder stage -fs \"$FS\" -format $FORMAT ${extra[*]:-} out/$OUT_NAME"; hdiutil imageinfo "out/$OUT_NAME" | grep -E '^Format:|Checksum Value|^Size'; } | tee "$EVIDENCE/dmg.txt"
 
       - name: Verify the app inside the new DMG and install a copy
         run: |
@@ -229,10 +231,12 @@ jobs:
           codesign -dv --verbose=4 "/Volumes/swarm-new/$APP_NAME" 2>&1 | tee -a "$out"
           grep -q '^Signature=adhoc' "$out"
           grep -q "^Identifier=$BUNDLE_ID\$" "$out"
-          a=$(codesign -dv "$APP" 2>&1 | awk -F= '/^CDHash=/ {print $2}')
-          b=$(codesign -dv "/Volumes/swarm-new/$APP_NAME" 2>&1 | awk -F= '/^CDHash=/ {print $2}')
+          # CDHash is printed only at --verbose=3 and above.
+          a=$(codesign -dv --verbose=4 "$APP" 2>&1 | awk -F= '/^CDHash=/ {print $2}')
+          b=$(codesign -dv --verbose=4 "/Volumes/swarm-new/$APP_NAME" 2>&1 | awk -F= '/^CDHash=/ {print $2}')
           echo "cdhash stage=$a dmg=$b" | tee -a "$out"
-          test -n "$a" && test "$a" = "$b"
+          test -n "$a"
+          test "$a" = "$b"
           mkdir -p "$RUNNER_TEMP/installed"
           ditto "/Volumes/swarm-new/$APP_NAME" "$RUNNER_TEMP/installed/$APP_NAME"
           codesign --verify --deep --strict --verbose=2 "$RUNNER_TEMP/installed/$APP_NAME" 2>&1 | tee -a "$out"
@@ -255,8 +259,11 @@ jobs:
           done
           echo "process $pid stayed up ${up}s of 20" | tee -a "$out"
           echo "--- DevTools page list (informational) ---" | tee -a "$out"
-          curl -s --max-time 5 http://127.0.0.1:9333/json/list | tee -a "$out" || true
+          curl -s --max-time 5 http://127.0.0.1:9333/json/list > pages.json || true
+          cat pages.json | tee -a "$out"
           echo | tee -a "$out"
+          page=0; grep -q '"title": "SWARM Node"' pages.json && page=1
+          echo "main window page titled SWARM Node: $page" | tee -a "$out"
           echo "--- processes of the app ---" | tee -a "$out"
           ps -ax -o pid,ppid,etime,command | grep -F "$RUNNER_TEMP/installed" | grep -v grep | cut -c1-220 | tee -a "$out" || true
           alive=0; kill -0 "$pid" 2>/dev/null && alive=1
@@ -272,7 +279,8 @@ jobs:
           echo "--- last lines of process output ---"; tail -40 "$EVIDENCE/smoke-process-output.log" || true
           if [ "$up" -lt 20 ] || [ "$alive" -ne 1 ]; then echo "::error::the app did not stay up for 20 s"; exit 1; fi
           if [ -n "$crashes" ]; then echo "::error::crash report written"; exit 1; fi
-          echo "SMOKE PASS: up 20 s, no crash report" | tee -a "$out"
+          if [ "$page" -ne 1 ]; then echo "::error::no SWARM Node window page"; exit 1; fi
+          echo "SMOKE PASS: up 20 s, SWARM Node window loaded, no crash report" | tee -a "$out"
 
       - name: Write SHA256SUMS for this architecture
         run: |

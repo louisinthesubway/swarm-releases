@@ -1,0 +1,78 @@
+name: Publish SWARM Node 0.2.0-mainnet.5 macOS ad hoc pre-release
+
+# Publishes the exact DMGs a green run of mac-node-adhoc.yml produced and
+# verified, as a pre-release. Nothing is rebuilt here: the artifacts of that
+# run are downloaded, checked against the SHA-256 values written in the notes,
+# and attached. The run and its commit are pinned below.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ci/mac-node-adhoc]
+    paths: ['.github/workflows/mac-node-adhoc-publish.yml']
+
+permissions:
+  contents: write
+  actions: read
+
+env:
+  SOURCE_RUN: '36900065041'
+  SOURCE_SHA: 89510a20034ae0f7eabbdea801e085565521b8ac
+  TAG: swarm-node-0.2.0-mainnet.5-macos-adhoc
+  TITLE: 'SWARM Node 0.2.0-mainnet.5 macOS - ad hoc signed, not notarized (re-signed copies of the per-architecture builds)'
+  NOTES: release-notes/swarm-node-0.2.0-mainnet.5-macos-adhoc.md
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the source run is the green run on the pinned commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN" --jq '[.conclusion, .head_sha, .path] | @tsv' | tee run.tsv
+          test "$(cut -f1 run.tsv)" = success
+          test "$(cut -f2 run.tsv)" = "$SOURCE_SHA"
+          test "$(cut -f3 run.tsv)" = .github/workflows/mac-node-adhoc.yml
+      - uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ env.SOURCE_RUN }}
+          github-token: ${{ github.token }}
+          pattern: dmg-mac-*
+          merge-multiple: true
+          path: release
+      - uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ env.SOURCE_RUN }}
+          github-token: ${{ github.token }}
+          name: SHA256SUMS
+          path: release
+      - name: Check the files against SHA256SUMS and the notes
+        run: |
+          set -euo pipefail
+          cd release
+          rm -f SHA256SUMS-mac-arm64 SHA256SUMS-mac-x64
+          ls -l
+          test "$(ls | wc -l)" = 3
+          sha256sum -c SHA256SUMS
+          while read -r sum name; do
+            grep -q "$sum" "../$NOTES"
+            echo "$name $(stat -c %s "$name") bytes, sha256 $sum (in notes)"
+          done < SHA256SUMS
+      - name: Create the pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then echo "::error::release $TAG already exists"; exit 1; fi
+          gh release create "$TAG" \
+            --target "$SOURCE_SHA" \
+            --prerelease \
+            --title "$TITLE" \
+            --notes-file "$NOTES" \
+            release/SWARM-Node-0.2.0-mainnet.5-mac-arm64-adhoc.dmg \
+            release/SWARM-Node-0.2.0-mainnet.5-mac-x64-adhoc.dmg \
+            release/SHA256SUMS
+          gh release view "$TAG" --json url,isPrerelease,assets --jq '{url, isPrerelease, assets: [.assets[] | {name, size, url}]}'
